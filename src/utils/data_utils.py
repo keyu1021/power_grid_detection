@@ -1,3 +1,4 @@
+import argparse
 import json
 import shutil
 from pathlib import Path
@@ -121,9 +122,14 @@ def split_photos(
     if ratios_array.shape != (3,) or np.any(ratios_array < 0) or ratios_array.sum() <= 0:
         raise ValueError("ratios must be a 3-tuple of non-negative values.")
 
+    include_test = float(ratios_array[2]) > 0.0
+
     if photos_df.empty:
         empty = pd.DataFrame(columns=["filename", "source_path", "split"])
-        return {"train": empty.copy(), "val": empty.copy(), "test": empty.copy()}
+        splits = {"train": empty.copy(), "val": empty.copy()}
+        if include_test:
+            splits["test"] = empty.copy()
+        return splits
 
     train_ratio, val_ratio, test_ratio = ratios_array / ratios_array.sum()
     shuffled = photos_df.sample(frac=1.0, random_state=seed).reset_index(drop=True)
@@ -146,8 +152,9 @@ def split_photos(
     splits = {
         "train": train_df.assign(split="train").sort_values("filename").reset_index(drop=True),
         "val": val_df.assign(split="val").sort_values("filename").reset_index(drop=True),
-        "test": test_df.assign(split="test").sort_values("filename").reset_index(drop=True),
     }
+    if include_test:
+        splits["test"] = test_df.assign(split="test").sort_values("filename").reset_index(drop=True)
     return splits
 
 
@@ -172,6 +179,9 @@ def build_coco_images(split_df: pd.DataFrame) -> list[Dict[str, Any]]:
 
 def write_split_dataset(split_name: str, split_df: pd.DataFrame, output_dir: Path) -> None:
     split_dir = output_dir / split_name
+    if split_dir.exists():
+        shutil.rmtree(split_dir)
+
     images_dir = split_dir / "images"
     images_dir.mkdir(parents=True, exist_ok=True)
 
@@ -220,3 +230,39 @@ def split_photo_dir(
         write_split_dataset(split_name, split_df, output_dir)
 
     return splits
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Split an orthophoto directory into train/val/test folders.")
+    parser.add_argument("--photos-dir", type=Path, required=True, help="Input orthophoto directory")
+    parser.add_argument("--output-dir", type=Path, required=True, help="Output split root")
+    parser.add_argument("--train-ratio", type=float, default=0.8)
+    parser.add_argument("--val-ratio", type=float, default=0.2)
+    parser.add_argument("--test-ratio", type=float, default=0.0)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--drop-black", action="store_true")
+    parser.add_argument("--drop-ocean-like", action="store_true")
+    parser.add_argument("--black-threshold", type=float, default=0.98)
+    parser.add_argument("--min-blue-ratio", type=float, default=1.05)
+    parser.add_argument("--max-variance", type=float, default=150.0)
+    args = parser.parse_args()
+
+    ratios = (args.train_ratio, args.val_ratio, args.test_ratio)
+    splits = split_photo_dir(
+        photos_dir=args.photos_dir.resolve(),
+        output_dir=args.output_dir.resolve(),
+        ratios=ratios,
+        seed=args.seed,
+        drop_black=args.drop_black,
+        drop_ocean_like=args.drop_ocean_like,
+        black_threshold=args.black_threshold,
+        min_blue_ratio=args.min_blue_ratio,
+        max_variance=args.max_variance,
+    )
+
+    for split_name, split_df in splits.items():
+        print(f"[done] {split_name}: images={len(split_df)}")
+
+
+if __name__ == "__main__":
+    main()

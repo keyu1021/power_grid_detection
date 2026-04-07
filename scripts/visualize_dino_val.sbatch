@@ -42,17 +42,19 @@ export LOCAL_RANK=0
 echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-<unset>}"
 nvidia-smi
 
-RUN_DIR="${RUN_DIR:-outputs/dino_ft_run1}"
+RUN_DIR="${RUN_DIR:-outputs/dino_ft_run2}"
+RUN_NAME="$(basename "${RUN_DIR}")"
 COCO_PATH="${COCO_PATH:-data/COCODIR}"
-CHECKPOINT="${CHECKPOINT:-checkpoint_best_regular.pth}"
 SCORE_THR="${SCORE_THR:-0.3}"
 MAX_IMAGES="${MAX_IMAGES:-48}"
-OUT_DIR="${OUT_DIR:-outputs/dino_ft_run1/val_vis}"
+INFER_DIR="${INFER_DIR:-inference/${RUN_NAME}}"
+PREDICTION_JSON="${PREDICTION_JSON:-${INFER_DIR}/predictions.json}"
+OUT_DIR="${OUT_DIR:-${INFER_DIR}/visualization}"
 
 python src/utils/visualize_dino_val.py \
   --run-dir "${RUN_DIR}" \
   --coco-path "${COCO_PATH}" \
-  --checkpoint "${CHECKPOINT}" \
+  --prediction-json "${PREDICTION_JSON}" \
   --score-thr "${SCORE_THR}" \
   --max-images "${MAX_IMAGES}" \
   --out-dir "${OUT_DIR}"

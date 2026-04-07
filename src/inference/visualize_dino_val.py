@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Visualize DINO validation predictions against ground truth tiles.
+"""Visualize saved DINO validation predictions against ground truth tiles.
 
 Creates side-by-side images:
   - Left: ground-truth boxes
-  - Right: predicted boxes (score-thresholded)
+  - Right: predicted boxes from an inference JSON file
 """
 
 from __future__ import annotations
@@ -23,27 +23,18 @@ def _repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
-def _dino_root() -> Path:
-    return _repo_root() / "src" / "models" / "DINO"
-
-
 def _load_run_args(run_dir: Path) -> SimpleNamespace:
     cfg_path = run_dir / "config_args_all.json"
-    if not cfg_path.exists():
-        raise FileNotFoundError(f"Missing config args file: {cfg_path}")
     payload = json.loads(cfg_path.read_text())
     return SimpleNamespace(**payload)
 
 
-def _build_model_and_dataset(run_args: SimpleNamespace):
-    # Import DINO modules by adding its source root to sys.path.
-    sys.path.insert(0, str(_dino_root()))
-    from main import build_model_main  # type: ignore
+def _build_dataset(run_args: SimpleNamespace):
+    # Import DINO dataset code by adding its source root to sys.path.
+    sys.path.insert(0, str(_repo_root() / "src" / "models" / "DINO"))
     from datasets import build_dataset  # type: ignore
-    from util.misc import clean_state_dict  # type: ignore
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    run_args.device = str(device)
+    run_args.device = "cpu"
     run_args.distributed = False
     run_args.rank = 0
     run_args.world_size = 1
@@ -53,12 +44,8 @@ def _build_model_and_dataset(run_args: SimpleNamespace):
     run_args.eval = True
     run_args.test = False
 
-    model, _, postprocessors = build_model_main(run_args)
-    model.to(device)
-    model.eval()
-
     dataset_val = build_dataset(image_set="val", args=run_args)
-    return model, postprocessors, dataset_val, clean_state_dict, device
+    return dataset_val
 
 
 def _denorm_to_pil(img_tensor: torch.Tensor) -> Image.Image:
@@ -112,34 +99,37 @@ def _concat_lr(left: Image.Image, right: Image.Image) -> Image.Image:
     return out
 
 
+def _load_predictions(prediction_path: Path) -> dict[int, dict]:
+    # Index predictions by image_id so dataset samples can look them up quickly.
+    payload = json.loads(prediction_path.read_text())
+    return {int(item["image_id"]): item for item in payload}
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Visualize DINO val predictions vs GT.")
-    parser.add_argument("--run-dir", type=Path, default=Path("outputs/dino_run2"))
-    parser.add_argument("--coco-path", type=Path, default=Path("data/COCODIR"))
-    parser.add_argument("--checkpoint", type=str, default="checkpoint_best_regular.pth")
+    parser = argparse.ArgumentParser(description="Visualize saved DINO predictions vs GT.")
+    parser.add_argument("--run-dir", type=Path, required=True)
+    parser.add_argument("--coco-path", type=Path, required=True)
+    parser.add_argument("--prediction-json", type=Path, required=True)
     parser.add_argument("--score-thr", type=float, default=0.30)
     parser.add_argument("--max-images", type=int, default=24)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--out-dir", type=Path, default=Path("outputs/dino_run2/val_vis"))
+    parser.add_argument("--out-dir", type=Path, required=True)
     args = parser.parse_args()
 
     run_dir = (_repo_root() / args.run_dir).resolve() if not args.run_dir.is_absolute() else args.run_dir
     out_dir = (_repo_root() / args.out_dir).resolve() if not args.out_dir.is_absolute() else args.out_dir
     coco_path = (_repo_root() / args.coco_path).resolve() if not args.coco_path.is_absolute() else args.coco_path
-    ckpt_path = run_dir / args.checkpoint
-
-    if not ckpt_path.exists():
-        raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
+    prediction_json = (
+        (_repo_root() / args.prediction_json).resolve()
+        if not args.prediction_json.is_absolute()
+        else args.prediction_json
+    )
 
     run_args = _load_run_args(run_dir)
     run_args.coco_path = str(coco_path)
     run_args.output_dir = str(run_dir)
-    model, postprocessors, dataset_val, clean_state_dict, device = _build_model_and_dataset(run_args)
-
-    checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    state = checkpoint["model"] if isinstance(checkpoint, dict) and "model" in checkpoint else checkpoint
-    model.load_state_dict(clean_state_dict(state), strict=False)
-    model.eval()
+    dataset_val = _build_dataset(run_args)
+    predictions_by_image = _load_predictions(prediction_json)
 
     ann_path = coco_path / "annotations" / "instances_val2017.json"
     ann = json.loads(ann_path.read_text())
@@ -152,56 +142,55 @@ def main() -> None:
     rng.shuffle(indices)
     indices = indices[: max(0, args.max_images)]
 
-    print(f"Device: {device}")
     print(f"Dataset size: {len(dataset_val)}")
     print(f"Rendering {len(indices)} samples -> {out_dir}")
 
-    with torch.no_grad():
-        for i, idx in enumerate(indices, start=1):
-            img_tensor, target = dataset_val[idx]
-            image = _denorm_to_pil(img_tensor)
-            w, h = image.size
+    for i, idx in enumerate(indices, start=1):
+        img_tensor, target = dataset_val[idx]
+        image = _denorm_to_pil(img_tensor)
+        w, h = image.size
 
-            inp = img_tensor.unsqueeze(0).to(device)
-            outputs = model(inp)
-            target_sizes = target["size"].unsqueeze(0).to(device)
-            result = postprocessors["bbox"](outputs, target_sizes)[0]
+        # Ground truth boxes are stored as normalized cxcywh in the dataset.
+        gt_xyxy = _cxcywh_to_xyxy_abs(target["boxes"].cpu(), w=w, h=h)
+        gt_boxes = gt_xyxy.tolist()
+        gt_labels = target["labels"].cpu().tolist()
 
-            # Ground truth boxes are normalized cxcywh at this point.
-            gt_xyxy = _cxcywh_to_xyxy_abs(target["boxes"].cpu(), w=w, h=h)
-            gt_boxes = gt_xyxy.tolist()
-            gt_labels = target["labels"].cpu().tolist()
+        image_id = int(target["image_id"].item())
+        pred = predictions_by_image.get(image_id, {})
+        pred_boxes = pred.get("boxes", [])
+        pred_labels = pred.get("labels", [])
+        pred_scores = pred.get("scores", [])
 
-            scores = result["scores"].cpu()
-            labels = result["labels"].cpu()
-            boxes = result["boxes"].cpu()
+        # The inference JSON may already be filtered, but this keeps visualization flexible.
+        kept_boxes = []
+        kept_labels = []
+        kept_scores = []
+        for box, label, score in zip(pred_boxes, pred_labels, pred_scores):
+            if score >= args.score_thr:
+                kept_boxes.append(box)
+                kept_labels.append(int(label))
+                kept_scores.append(float(score))
 
-            keep = scores >= args.score_thr
-            pred_boxes = boxes[keep].tolist()
-            pred_labels = labels[keep].tolist()
-            pred_scores = scores[keep].tolist()
+        gt_img = _draw_boxes(
+            image=image,
+            boxes=gt_boxes,
+            labels=gt_labels,
+            scores=None,
+            color="lime",
+            id_to_name=id_to_name,
+        )
+        pred_img = _draw_boxes(
+            image=image,
+            boxes=kept_boxes,
+            labels=kept_labels,
+            scores=kept_scores,
+            color="red",
+            id_to_name=id_to_name,
+        )
 
-            gt_img = _draw_boxes(
-                image=image,
-                boxes=gt_boxes,
-                labels=gt_labels,
-                scores=None,
-                color="lime",
-                id_to_name=id_to_name,
-            )
-            pred_img = _draw_boxes(
-                image=image,
-                boxes=pred_boxes,
-                labels=pred_labels,
-                scores=pred_scores,
-                color="red",
-                id_to_name=id_to_name,
-            )
-
-            merged = _concat_lr(gt_img, pred_img)
-            image_id = int(target["image_id"].item())
-            out_path = out_dir / f"{i:03d}_imageid_{image_id}.png"
-            merged.save(out_path)
+        merged = _concat_lr(gt_img, pred_img)
+        out_path = out_dir / f"{i:03d}_imageid_{image_id}.png"
+        merged.save(out_path)
 
     print(f"Done. Saved visualizations to: {out_dir}")
 

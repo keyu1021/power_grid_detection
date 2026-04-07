@@ -40,7 +40,7 @@ export LOCAL_RANK=0
 cd "${PROJECT_ROOT}"
 
 # Fine-tune on the tower-only COCO dataset.
-COCO_PATH="${COCO_PATH:-${PROJECT_ROOT}/data/COCODIR_tower}"
+COCO_PATH="${COCO_PATH:-${PROJECT_ROOT}/data/COCODIR}"
 
 # Source checkpoint to initialize from.
 # Override at submit time, for example:
@@ -78,11 +78,11 @@ python src/models/DINO/main.py \
   --finetune_ignore label_enc.weight class_embed \
   --num_workers 2 \
   --options \
-    num_classes=2 \
-    dn_labelbook_size=2 \
+    num_classes=4 \
+    dn_labelbook_size=4 \
     dn_scalar=100 \
     embed_init_tgt=TRUE \
     dn_label_coef=1.0 \
     dn_bbox_coef=1.0 \
     use_ema=False \
-    dn_box_noise_scale=1  .0
+    dn_box_noise_scale=1.0
